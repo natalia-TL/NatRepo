@@ -1,0 +1,537 @@
+---
+title: "Prescipt - Freebies"
+output: html_document
+date: "2022-09-27"
+---
+
+```{r setup, include=FALSE}
+library(bigrquery)
+library(dplyr)
+library(DBI)
+library(tidyverse)
+library(magrittr)
+library(fastDummies)
+library(zoo)
+library(lubridate)
+```
+
+When running the algorithm remember following!
+
+- Edit the extraction paths so it fits your procedure. The bottom part of each flair script, as well as in the very bottom (Can be done with search and replace - CTRL + F)
+- Put the file "training_data_algorithm_r72_newnegative" in every folder for each site
+- Manually download positions from Campaign meister and save under the name "pos". Save in the same folder as the script.
+- Change Date subset in line 139 and 140 so it fits current and last month
+- ATM in the voonix data pulled from Big Query, we do not have that many clicks included
+- To run RALPH - IF IT IS NOT THE FIRST SCRIPT RUN - position yourself on line 373 by clicking on the line. Then click "Run" -> "Run all chunks below" (This is important! Otherwise you will
+  the big query extract once again) 
+
+_______________________________________________________________________________
+
+OVERALL DATA FLOW AND PROCESS
+
+# Loading training data (Regression)
+
+```{r}
+training_data <- read.csv("training_data_algorithm_r72_newnegative.csv")
+```
+
+# Adjusting variables (Regression)
+
+```{r}
+# Selecting variables to include
+
+# No positions = 21 and removing NA scores. In addition for the algorithm to work on lists with maybe only 12 or 18 pos, then assigning 4 categories of positions.
+
+training_data %<>% mutate(Position = replace_na(Position, 21)) %>% mutate(Position = case_when(Position < 6 ~ "high",
+                                                                                          Position > 5 & Position < 16 ~ "middle",
+                                                                                          Position > 15 & Position < 21 ~ "low",
+                                                                                          Position > 20 ~ "no pos")) %>% na.omit()
+
+# Positions and new as dummy variable
+
+training_data <- dummy_cols(training_data, select_columns = "Position")
+
+training_data <- dummy_cols(training_data, select_columns = "new")
+
+# Removing the original above variables to avoid multicollinarity.
+
+training_data %<>% select(!(c(new, Position)))
+
+# Indexing for removing names and to add them later. 
+
+training_data$index <- 1:nrow(training_data)
+
+new_index <- training_data[, c("name", "index")]
+
+training_data %<>% select(!(name)) 
+```
+
+# Creating model (Regression)
+
+```{r}
+# Setting seed for same results
+
+set.seed(2200)
+
+# Creating the actual linear model.
+
+lm_new <- lm(score ~ . - index, training_data)
+
+# Summary to check R^2 and importance/weighing of variables
+summary(lm_new)
+```
+
+# Loading Voonix data from Big Query (Voonix)
+
+```{r}
+con <- dbConnect(
+  bigrquery::bigquery(),
+  project = "casinomeister-302312",
+  dataset = "CoverageMapDB",
+  billing = "casinomeister-302312"
+)
+
+con
+```
+
+```{r}
+sql <- "SELECT DISTINCT
+
+CAST((date) AS DATE) AS Date,
+
+adve_name,
+
+sitename,
+
+media,
+
+
+
+SUM(ftd) AS FTD,
+
+SUM(cpa_count) AS CPA,
+
+SUM(clicks) AS Clicks,
+
+SUM(signups) AS Signups,
+
+SUM(rev_income) AS REV_income,
+
+SUM(cpa_income) AS CPA_income,
+
+SUM(extra_fee) AS Extra_fee
+
+
+
+FROM `master-casino-stats.voonix_stats.monthly202*` 
+
+WHERE DATE(date) > CURRENT_DATE() + INTERVAL -2 MONTH
+
+GROUP BY  Date, adve_id, adve_name, sitename, media
+
+
+
+--Order by 1 desc"
+
+## SQL Language
+
+voonix <- dbGetQuery(con, sql)
+
+options(scipen = 999)
+```
+
+# REMEBER TO CHANGE THE DATE SUBSET!
+
+```{r}
+prev_month <- voonix %>% subset(Date == "2022-12-01") %>% select(!(Date)) %>% as.data.frame() 
+current_month <- voonix %>% subset(Date == "2023-01-01")%>% select(!(Date)) %>% as.data.frame()
+voonix <- full_join(prev_month, current_month, by = c("adve_name", "sitename", "media"))
+
+
+voonix[is.na(voonix)] <- 0
+
+# Adding the two months together
+voonix <- transform(voonix, FTD = FTD.x + FTD.y)
+voonix <- transform(voonix, CPA = CPA.x + CPA.y)
+voonix <- transform(voonix, Clicks = Clicks.x + Clicks.y)
+voonix <- transform(voonix, Signups = Signups.x + Signups.y)
+voonix <- transform(voonix, REV_income = REV_income.x + REV_income.y)
+voonix <- transform(voonix, CPA_income = CPA_income.x + CPA_income.y)
+voonix <- transform(voonix, Extra_fee = Extra_fee.x + Extra_fee.y)
+
+# Removing .x and .y variables
+voonix %<>% select(!(c("FTD.x", "FTD.y", "CPA.x", "CPA.y", "Clicks.x", "Clicks.y", "Signups.x", "Signups.y", "REV_income.x", "REV_income.y", "CPA_income.x", "CPA_income.y", "Extra_fee.x", "Extra_fee.y")))
+
+voonix$adve_name <- gsub("Luckom", "luckcom", voonix$adve_name, fixed = TRUE)
+```
+
+# Calculating variables C.FTD.., SU.FTD.., Total.income, click_value (Voonix)
+
+```{r}
+voonix %<>% mutate(REV_income = case_when(REV_income < 0 ~ 0,
+                             TRUE ~ REV_income))
+
+voonix %<>% mutate(C.FTD.. = FTD/Clicks) %>% mutate(SU.FTD.. = FTD/Signups) %>% mutate(Total.income = REV_income + CPA_income + Extra_fee)
+
+# Creating click_value variable
+voonix %<>% mutate(Clicks = case_when(Clicks == 0 ~ FTD,
+                             TRUE ~ Clicks))
+
+voonix$click_value <- voonix$Total.income / voonix$Clicks
+
+# Removing redundant variables
+voonix_add <- voonix
+
+voonix %<>% select(!(c(Total.income, REV_income, CPA_income, Extra_fee, Signups)))
+
+# Inf = 0
+
+voonix[voonix == "Inf"] <- 0
+
+# Renaming variables
+
+voonix <- rename(voonix, Advertiser = adve_name)
+
+```
+
+# Removing non-active media (Voonix)
+
+```{r}
+voonix <- subset(voonix, media!="Legacy" & media!="email" & media!="Fallback" & media!="casinoeagle" & media!="Facebook BH" & media!="SEO" & media!="Google Ads" & media!="SMS")
+```
+
+
+# Getting wordpress data from BigQuery (Wordpress)
+
+```{r}
+sql2 <- "SELECT DISTINCT
+
+siteid,
+
+post_date_gmt,
+
+closedStatus,
+
+casinoID
+
+FROM `casinomeister-302312.CoverageMapDB.wordpress`"
+
+wordpress <- dbGetQuery(con, sql2)
+
+wordpress$casinoID <- gsub("luckom", "luckcom", wordpress$casinoID, fixed = TRUE)
+wordpress$casinoID <- gsub("sisu-3972", "sisu", wordpress$casinoID, fixed = TRUE)
+
+```
+
+_____________________________________________
+
+Bad payers
+- Get Outstanding Report from Finance, save it as beneath (outstanding_report)
+- Download CSV of Lime filtered on Operators and adding the "Date established"
+- Download Operator list and Brand list from lime! (Save files as: Operators & Brands)
+
+```{r}
+bad_payers <- read.csv("outstanding_report.csv")
+```
+
+```{r}
+# Selecting relevant variables
+
+bad_payers %<>% rename(Operator = Name)
+
+# Removing text after "-" in string
+bad_payers$Operator <- gsub("-.*","", bad_payers$Operator)
+bad_payers$Operator <- gsub("TH.*","", bad_payers$Operator)
+
+# Removing leading and trailing whitespace
+bad_payers$Operator <- trimws(bad_payers$Operator)
+```
+
+```{r}
+# Renaming variables
+
+bad_payers <- rename(bad_payers, operator = Operator)
+bad_payers <- rename(bad_payers, m1 = X0.30.days) 
+bad_payers <- rename(bad_payers, m2 = X31.60.days)
+bad_payers <- rename(bad_payers, m3 = X..60.days)
+
+bad_payers$m1 <- as.numeric(gsub(",","",bad_payers$m1))
+bad_payers$m2 <- as.numeric(gsub(",","",bad_payers$m2))
+bad_payers$m3 <- as.numeric(gsub(",","",bad_payers$m3))
+
+```
+
+# Getting the Operators creation date for the dataset 
+
+```{r}
+operators <- read.csv("Operators.csv")
+```
+
+```{r}
+operators %<>% select(c(Company.name, Date.established))
+
+operators <- rename(operators, operator = Company.name)
+operators <- rename(operators, established = Date.established)
+
+# Making established as date
+operators$established[operators$established == ""] <- "1/1/2020"
+
+operators$established <- as.Date(operators$established, format = "%m/%d/%Y")
+
+# Getting current date and calculating age in days
+operators$today <- Sys.Date()
+
+operators$age_days <- operators$today - operators$established
+
+# Defining whether they are new or not
+operators %<>% mutate(new = case_when(age_days < 90 ~ 1,
+                                  age_days > 90 ~ 0))
+
+operators %<>% select(c(operator, new))
+```
+
+```{r}
+bad_payers <- left_join(bad_payers, operators)
+```
+
+```{r}
+# Defining whether they bad_payer or not
+bad_payers[is.na(bad_payers)] <- 0
+
+bad_payers %<>% mutate(bad_payer = case_when(new == 1 & m2 >= 0 & m3 >= 0 ~ "Yes",
+                                  new == 0 & m3 > 100 ~ "Yes",
+                                  TRUE ~ "No"))
+
+bad_payers %<>% select(c(operator, bad_payer))
+```
+
+```{r}
+brand_payers <- read.csv("Brands.csv")
+
+brand_payers %<>% rename(operator = Company)
+
+brand_payers %<>% subset(operator!="")
+
+bad_payers <- left_join(brand_payers, bad_payers)
+
+bad_payers[is.na(bad_payers)] <- "No"
+
+bad_payers %<>% rename(brand = Brand.Name)
+
+bad_payers %<>% select(c(brand, bad_payer))
+```
+
+```{r}
+bad_payers$brand <- tolower(bad_payers$brand)
+
+bad_payers$brand <- gsub(" ", "", bad_payers$brand, fixed = TRUE)
+bad_payers$brand <- gsub(".", "", bad_payers$brand, fixed = TRUE)
+
+bad_payers <- rename(bad_payers, name = brand)
+
+bad_payers %<>% distinct(name, .keep_all = TRUE)
+```
+
+________________________________________________________________________________
+
+# Loading data for page specific metrics and if they have deal present
+
+```{r}
+
+sql3 <- "SELECT DISTINCT
+
+brandid,
+marketid,
+ARRAY_TO_STRING(games, ',') AS Games,
+ARRAY_TO_STRING(paymentproviders, ',') AS Paymentproviders,
+payment.payNPlay AS paynplayCM,
+details.localLanguage,
+
+CASE WHEN (details.localLanguage) IS TRUE THEN '1' ELSE '0' END AS Local,
+CASE WHEN (payment.payNPlay) IS TRUE THEN '1' ELSE '0' END AS PayNPlay,
+CASE WHEN 'Zimpler' IN UNNEST(paymentproviders)THEN '1' ELSE '0' END AS Zimpler,
+CASE WHEN 'Brite' IN UNNEST(paymentproviders)THEN '1' ELSE '0' END AS Brite,
+CASE WHEN 'Trustly' IN UNNEST(paymentproviders)THEN '1' ELSE '0' END AS Trustly,
+CASE WHEN 'Visa' IN UNNEST(paymentproviders)THEN '1' ELSE '0' END AS Visa,
+CASE WHEN 'Paypal' IN UNNEST(paymentproviders)THEN '1' ELSE '0' END AS Paypal,
+CASE WHEN 'Siirto' IN UNNEST(paymentproviders)THEN '1' ELSE '0' END AS Siirto,
+CASE WHEN 'Euteller' IN UNNEST(paymentproviders)THEN '1' ELSE '0' END AS Euteller,
+CASE WHEN 'SIRU Mobile' IN UNNEST(paymentproviders)THEN '1' ELSE '0' END AS SIRU,
+CASE WHEN 'Betting' IN UNNEST(games)THEN '1' ELSE '0' END AS Betting,
+CASE WHEN 'Bingo' IN UNNEST(games)THEN '1' ELSE '0' END AS Bingo,
+CASE WHEN 'Live casino' IN UNNEST(games)THEN '1' ELSE '0' END AS Casino
+
+FROM `thunderkick-prod.casinomeister.latestData_casinomeister_dataByCountries` 
+
+"
+
+globaldata <- dbGetQuery(con, sql3)
+
+globaldata$brandid <- gsub("iiwildcasino", "iwildcasino", globaldata$brandid)
+
+globaldatatesting <- globaldata
+
+globaldata$brandid <- gsub("-", "", globaldatatesting$brandid, fixed = TRUE)
+
+globaldata$brandid <- gsub("luckom", "luckcom", globaldata$brandid, fixed = TRUE)
+```
+
+```{r}
+globaldatatesting %<>% select(!(c(Games, Paymentproviders, paynplayCM, localLanguage)))
+```
+
+## Adding whether a deal is present in the GEO for either site or paid position
+
+```{r}
+sql4 <- "SELECT DISTINCT
+
+channel.slug AS channel,
+brand.slug AS brandid,
+market.slug AS marketid
+
+FROM `thunderkick-prod.affiliate_meister_data.latestData`
+
+WHERE channel.slug = 'site' OR channel.slug = 'paid-position' 
+  AND status.id = 1
+"
+
+deal_geo <- dbGetQuery(con, sql4)
+
+deal_geo %<>% mutate(marketid = case_when(marketid == "se" ~ "row",  TRUE ~ marketid))
+
+deal_geo$brandid <- gsub("luckom", "luckcom", deal_geo$brandid, fixed = TRUE)
+
+deal_geo$brandid <- gsub("sisu-3972", "sisu", deal_geo$brandid, fixed = TRUE)
+
+globaldata <- left_join(globaldata, deal_geo)
+
+globaldata %<>% subset(marketid == "fi" | marketid == "de" | marketid == "row" | marketid == "ro") 
+
+globaldata %<>% subset(channel == "paid-position" | channel == "site")
+
+globaldatatesting$deal <- 1 # Maybe not necessary check later
+
+globaldata %<>% select(!(c(Games, Paymentproviders)))
+```
+
+
+_________________________________________________________________
+
+CM DATA AUTOMATAED!!!
+
+
+```{r}
+sql5 <- "SELECT DISTINCT 
+
+casinoId,
+flair,
+positionNumber,
+siteid,
+type,
+campaignPeriodMonth AS month,
+campaignPeriodYear AS year,
+listType
+
+FROM `thunderkick-prod.casinomeister.latestData_campaignMeister`
+  WHERE status = 'Active'
+  AND campaignPeriodYear > 2021"
+
+pos_extract <- dbGetQuery(con, sql5)
+```
+
+# Loading positions (Positions) ATM Manual data download
+
+```{r}
+# Adjusting variables for merging
+pos_new <- pos_extract
+
+pos_new <- rename(pos_new, name = casinoId)
+pos_new <- rename(pos_new, Site = siteid)
+pos_new <- rename(pos_new, Position = positionNumber)
+pos_new <- rename(pos_new, ListType = listType)
+pos_new <- rename(pos_new, Flair = flair)
+
+pos_new$name <- gsub("luckom", "luckcom", pos_new$name, fixed = TRUE)
+
+# Current pos
+
+pos_new$my <- paste(pos_new$month, pos_new$year) 
+
+pos_new %<>% select(!(c(month, year)))
+
+pos_new$my <- as.yearmon(pos_new$my)
+pos_new$my <- as.Date(pos_new$my)
+
+## Extracting current month from Sys.Date()
+sys_date <- format(Sys.Date(),"%Y-%m")
+sys_date <- data.frame(sys_date)
+sys_date$day <- "-01"
+sys_date <- paste(sys_date, collapse="")
+sys_date <- data.frame(sys_date)
+sys_date$sys_date %<>% as.Date()
+
+pos_new %<>% subset(my == sys_date)
+
+pos_new %<>% unique()
+
+# Sold pos
+
+sold_pos_main <- pos_extract
+
+sold_pos_main <- rename(sold_pos_main, name = casinoId)
+sold_pos_main <- rename(sold_pos_main, Site = siteid)
+sold_pos_main <- rename(sold_pos_main, Position = positionNumber)
+sold_pos_main <- rename(sold_pos_main, ListType = listType)
+sold_pos_main <- rename(sold_pos_main, Flair = flair)
+
+sold_pos_main$name <- gsub("luckom", "luckcom", sold_pos_main$name, fixed = TRUE)
+
+sold_pos_main$my <- paste(sold_pos_main$month, sold_pos_main$year) 
+
+sold_pos_main %<>% select(!(c(month, year)))
+
+sold_pos_main$my <- as.yearmon(sold_pos_main$my)
+sold_pos_main$my <- as.Date(sold_pos_main$my)
+
+## Extracting next month from Sys.Date()
+sys_date <- format(Sys.Date(),"%Y-%m")
+sys_date <- data.frame(sys_date)
+sys_date$day <- "-01"
+sys_date <- paste(sys_date, collapse="")
+sys_date <- data.frame(sys_date)
+sys_date$sys_date %<>% as.Date()
+
+
+sys_date$sys_date <- sys_date$sys_date %m+% period("1 month")
+
+sold_pos_main %<>% subset(my == sys_date)
+
+sold_pos_main %<>% unique()
+```
+
+
+# Account and deal information
+
+```{r}
+sql6 <- "SELECT DISTINCT
+affiliateSoftwareAccount.loginUsername AS account,
+brand.slug AS name,
+market.slug AS market,
+cpa,
+revshare,
+baseline
+
+ FROM `thunderkick-prod.affiliate_meister_data.latestData` 
+  WHERE channel.slug = 'site'
+  AND market.slug = 'fi' OR market.slug = 'de' OR market.slug = 'row' OR market.slug = 'ro'"
+
+deal_account <- dbGetQuery(con, sql6)
+
+# Adjusting wrong slug naming
+
+deal_account$name <- gsub("luckom", "luckcom", deal_account$name, fixed = TRUE)
+deal_account$name <- gsub("winbet-3935", "winbet", deal_account$name, fixed = TRUE)
+deal_account$name <- gsub("betano", "betano.ro", deal_account$name, fixed = TRUE)
+```
+
+________________________________________________________________________________
